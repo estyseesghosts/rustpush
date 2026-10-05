@@ -269,13 +269,14 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
     pub async fn request_me(&self, url: &str, enter: impl Serialize) -> Result<Vec<u8>, PushError> {
         let state_lock = self.state.read().await;
-        let resp = REQWEST.post(format!("{}/{}/sharedstreams/{}", state_lock.host, state_lock.dsid, url))
+        let host = state_lock.host.clone();
+        let dsid = state_lock.dsid.clone();
+        drop(state_lock);
+        let resp = REQWEST.post(format!("{}/{}/sharedstreams/{}", host, dsid, url))
             .headers(self.get_headers().await?)
             .header("Content-Type", "text/plist")
             .body(plist_to_string(&enter)?)
             .send().await?;
-
-        drop(state_lock);
 
         let mut state_lock = self.state.write().await;
         if let Some(host) = resp.headers().get("X-Apple-MME-Host") {

@@ -452,13 +452,17 @@ impl IdentityResource {
     }
 
     pub async fn get_possible_handles(&self) -> Result<HashSet<String>, PushError> {
+        // Global lock order: cache -> users -> aps.state. This matches
+        // get_sms_targets/ensure_private_self and re-registration (generate), which
+        // both acquire cache before users. Taking users before cache here formed a
+        // users -> cache -> users cycle with ensure_private_self.
+        let mut cache_lock = self.cache.lock().await;
         let users_locked = self.users.read().await;
         let state = self.aps.state.read().await;
         let mut possible_handles = HashSet::new();
         for user in &*users_locked {
             let data = user.get_handle_data(&*state).await?;
 
-            let mut cache_lock = self.cache.lock().await;
             for handle in data {
                 for (alias, attributes) in handle.aliases {
                     for (service, _) in attributes.allowed_services {

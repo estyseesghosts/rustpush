@@ -1338,8 +1338,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let state = self.state.read().await;
         if state.keystore.0.is_empty() {
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+            // Clone the identity, then release the read guard before the await.
+            // fetch_shares_for re-acquires state.read() after its CloudKit call;
+            // a writer queued in between (e.g. sync_trust from is_in_clique)
+            // would deadlock the reentrant read behind itself.
+            let user = state.user_identity.clone().unwrap();
             drop(state);
+            let shares = self.fetch_shares_for(&user).await?;
             self.store_keys(&shares).await?;
         } else {
             drop(state);
@@ -1987,9 +1992,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         if with_tlk_shares.is_empty() {
             let state = state.downgrade();
-            // fetch tlk shares
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+            // Release the downgraded read guard before the await: fetch_shares_for
+            // re-acquires state.read() after its CloudKit call, which would deadlock
+            // behind any writer queued after the downgrade.
+            let user = state.user_identity.clone().unwrap();
             drop(state);
+            // fetch tlk shares
+            let shares = self.fetch_shares_for(&user).await?;
             self.store_keys(&shares).await?;
         } else {
             drop(state);
@@ -2111,14 +2120,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     async fn get_escrow_headers(&self) -> Result<HeaderMap, PushError> {
-        let state_lock = self.state.read().await;
+        // No state guard is needed here: the escrow headers are static plus anisette.
+        // Acquiring state.read() previously re-entered the lock when called from
+        // invoke_escrow (which held its own read guard across this await).
         let mut map = HeaderMap::new();
         map.insert("User-Agent", self.config.get_normal_ua("com.apple.sbd/638.100.48").parse().unwrap());
         map.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
         map.insert("x-apple-i-device-type", "1".parse().unwrap());
         map.insert("Accept", "*/*".parse().unwrap());
-        map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());        
-        drop(state_lock);
+        map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());
 
         let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
 
@@ -2134,12 +2144,14 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let email = self.token_provider.get_gsa_email().await.expect("no email!");
 
         let state = self.state.read().await;
-        let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", state.host, request.command.get_url()))
+        let host = state.host.clone();
+        drop(state);
+        let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", host, request.command.get_url()))
             .headers(self.get_escrow_headers().await?)
             .header("Content-Type", "application/x-apple-plst")
             .basic_auth(&email, Some(&auth))
             .body(plist_to_string(&request)?)
-            .send().await?; 
+            .send().await?;
 
         if !resp.status().is_success() {
             return Err(PushError::EscrowError(plist::from_bytes(&resp.bytes().await?)?))
